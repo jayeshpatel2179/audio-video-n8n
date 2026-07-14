@@ -1,0 +1,17 @@
+{
+  "name": "audio-blackscreen-render-service",
+  "version": "1.0.0",
+  "description": "Joins multiple audio files in order and renders a black-screen MP4, for use with n8n + Trello",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
