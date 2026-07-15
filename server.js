@@ -29,29 +29,6 @@ function checkApiKey(req, res, next) {
   next();
 }
 
-// ---- Multer setup: temp storage per job ----
-const upload = multer({
-  storage: multer.diskStorage({
-    destination: (req, file, cb) => {
-      const jobId = req.jobId;
-      const dir = path.join(JOBS_DIR, jobId);
-      fs.mkdirSync(dir, { recursive: true });
-      cb(null, dir);
-    },
-    filename: (req, file, cb) => {
-      // Keep original filename — we need it to sort by Part_N_of_M
-      cb(null, file.originalname);
-    },
-  }),
-  limits: { fileSize: 200 * 1024 * 1024, files: MAX_FILES }, // 200MB per file safety cap
-});
-
-// Assign a jobId before multer runs, so files land in the right folder
-function assignJobId(req, res, next) {
-  req.jobId = crypto.randomUUID();
-  next();
-}
-
 // ---- Helper: extract Part_N from filename, fallback to Infinity (sorts last) ----
 function extractPartNumber(filename) {
   const match = filename.match(/Part[_\s-]?(\d+)[_\s-]?of/i);
@@ -76,57 +53,98 @@ function runFfmpeg(args, jobId) {
   });
 }
 
-// ---- POST /render ----
-// multipart/form-data, field name: "audio" (repeat for each file, original filenames preserved)
-// optional query/body params: width, height, fps
-app.post('/render', assignJobId, checkApiKey, upload.array('audio', MAX_FILES), async (req, res) => {
-  const jobId = req.jobId;
-  const files = req.files || [];
+// ---- POST /job/start ----
+// Creates a new job and returns its jobId. Call this once before uploading any files.
+app.post('/job/start', checkApiKey, (req, res) => {
+  const jobId = crypto.randomUUID();
+  const dir = path.join(JOBS_DIR, jobId);
+  fs.mkdirSync(dir, { recursive: true });
+  jobs[jobId] = {
+    status: 'collecting',
+    createdAt: Date.now(),
+    files: [], // { originalname, path }
+  };
+  res.json({ jobId });
+});
 
-  if (files.length === 0) {
-    return res.status(400).json({ error: 'No audio files received. Use field name "audio".' });
+// ---- POST /job/:jobId/upload ----
+// Upload ONE audio file at a time. Call this once per file — n8n's HTTP Request
+// node already loops automatically over items, so no manual multipart-building
+// or Code node buffer work is needed on the n8n side.
+// multipart/form-data, single field name: "audio"
+const uploadSingle = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => {
+      const jobId = req.params.jobId;
+      const dir = path.join(JOBS_DIR, jobId);
+      if (!fs.existsSync(dir)) {
+        return cb(new Error('Unknown jobId. Call /job/start first.'));
+      }
+      cb(null, dir);
+    },
+    filename: (req, file, cb) => cb(null, file.originalname),
+  }),
+  limits: { fileSize: 200 * 1024 * 1024 },
+});
+
+app.post('/job/:jobId/upload', checkApiKey, (req, res, next) => {
+  const jobId = req.params.jobId;
+  if (!jobs[jobId]) {
+    return res.status(404).json({ error: 'Unknown jobId. Call /job/start first.' });
   }
-  if (files.length > MAX_FILES) {
-    return res.status(400).json({ error: `Max ${MAX_FILES} audio files allowed.` });
+  next();
+}, uploadSingle.single('audio'), (req, res) => {
+  const jobId = req.params.jobId;
+  if (!req.file) {
+    return res.status(400).json({ error: 'No file received. Use field name "audio".' });
+  }
+  if (jobs[jobId].files.length >= MAX_FILES) {
+    return res.status(400).json({ error: `Max ${MAX_FILES} audio files allowed per job.` });
+  }
+  jobs[jobId].files.push({ originalname: req.file.originalname, path: req.file.path });
+  res.json({ jobId, received: req.file.originalname, totalFilesSoFar: jobs[jobId].files.length });
+});
+
+// ---- POST /job/:jobId/finish ----
+// Call after all files are uploaded. Sorts by Part_N_of_M, renders in the
+// background, and returns immediately — poll /status/:jobId for completion.
+// optional body params: width, height, fps
+app.post('/job/:jobId/finish', checkApiKey, express.urlencoded({ extended: true }), express.json(), (req, res) => {
+  const jobId = req.params.jobId;
+  const job = jobs[jobId];
+  if (!job) {
+    return res.status(404).json({ error: 'Unknown jobId.' });
+  }
+  if (job.files.length === 0) {
+    return res.status(400).json({ error: 'No files were uploaded for this job.' });
   }
 
-  // Sort by Part_N_of_M extracted from filename
-  const sortable = files.map((f) => ({
+  const sortable = job.files.map((f) => ({
     file: f,
     part: extractPartNumber(f.originalname),
   }));
 
   const anyMissing = sortable.some((s) => s.part === null);
   if (anyMissing) {
-    // Fallback: keep upload order, but flag it clearly in the job record
-    jobs[jobId] = jobs[jobId] || {};
-    jobs[jobId].warning = 'One or more filenames did not match "Part_N_of_M" pattern — used upload order instead.';
+    job.warning = 'One or more filenames did not match "Part_N_of_M" pattern — used upload order instead.';
   } else {
     sortable.sort((a, b) => a.part - b.part);
   }
 
   const orderedPaths = sortable.map((s) => s.file.path);
 
-  const width = parseInt(req.body.width) || 1280;
-  const height = parseInt(req.body.height) || 720;
-  const fps = parseInt(req.body.fps) || 25;
+  const width = parseInt(req.body.width) || 640;
+  const height = parseInt(req.body.height) || 360;
+  const fps = parseInt(req.body.fps) || 1;
 
   const outputPath = path.join(JOBS_DIR, jobId, 'final_output.mp4');
 
-  jobs[jobId] = {
-    ...jobs[jobId],
-    status: 'processing',
-    createdAt: Date.now(),
-    fileOrder: sortable.map((s) => s.file.originalname),
-    outputPath,
-  };
+  job.status = 'processing';
+  job.fileOrder = sortable.map((s) => s.file.originalname);
+  job.outputPath = outputPath;
 
-  // Respond immediately with jobId; render happens in background
-  res.json({ jobId, status: 'processing', order: jobs[jobId].fileOrder, warning: jobs[jobId].warning });
+  res.json({ jobId, status: 'processing', order: job.fileOrder, warning: job.warning });
 
-  // ---- Build single-pass ffmpeg command ----
-  // Black video is an infinite lavfi source; -shortest trims it to match the
-  // concatenated audio length, so we never need to precompute duration.
   const inputArgs = [];
   inputArgs.push('-f', 'lavfi', '-i', `color=c=black:s=${width}x${height}:r=${fps}`);
   orderedPaths.forEach((p) => {
@@ -142,23 +160,23 @@ app.post('/render', assignJobId, checkApiKey, upload.array('audio', MAX_FILES), 
     '-map', '0:v',
     '-map', '[outa]',
     '-c:v', 'libx264',
+    '-preset', 'ultrafast',
     '-tune', 'stillimage',
+    '-crf', '30',
     '-pix_fmt', 'yuv420p',
+    '-r', String(fps),
     '-c:a', 'aac',
-    '-b:a', '192k',
+    '-b:a', '128k',
     '-shortest',
     '-movflags', '+faststart',
+    '-threads', '1',
     '-y',
     outputPath,
   ];
 
-  try {
-    await runFfmpeg(args, jobId);
-    jobs[jobId].status = 'done';
-  } catch (err) {
-    jobs[jobId].status = 'error';
-    jobs[jobId].error = err.message;
-  }
+  runFfmpeg(args, jobId)
+    .then(() => { job.status = 'done'; })
+    .catch((err) => { job.status = 'error'; job.error = err.message; });
 });
 
 // ---- GET /status/:jobId ----
