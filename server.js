@@ -39,14 +39,27 @@ function extractPartNumber(filename) {
 // ---- Helper: run ffmpeg and resolve/reject on exit ----
 function runFfmpeg(args, jobId) {
   return new Promise((resolve, reject) => {
-    const proc = spawn('ffmpeg', args);
+    // stdio: explicitly close stdin ('ignore'). Without this, ffmpeg can hang
+    // indefinitely waiting on an open-but-unused stdin pipe when spawned
+    // headlessly (a well-known child_process + ffmpeg gotcha).
+    const proc = spawn('ffmpeg', ['-nostdin', ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
     let stderr = '';
+
+    const killTimeout = setTimeout(() => {
+      proc.kill('SIGKILL');
+      reject(new Error('ffmpeg timed out after 10 minutes and was killed. Last log:\n' + stderr.slice(-2000)));
+    }, 10 * 60 * 1000);
+
     proc.stderr.on('data', (d) => {
       stderr += d.toString();
       jobs[jobId].log = stderr.slice(-4000); // keep last ~4000 chars for debugging
     });
-    proc.on('error', (err) => reject(err));
+    proc.on('error', (err) => {
+      clearTimeout(killTimeout);
+      reject(err);
+    });
     proc.on('close', (code) => {
+      clearTimeout(killTimeout);
       if (code === 0) resolve();
       else reject(new Error(`ffmpeg exited with code ${code}. Last log:\n${stderr.slice(-2000)}`));
     });
@@ -188,6 +201,7 @@ app.get('/status/:jobId', checkApiKey, (req, res) => {
     warning: job.warning,
     order: job.fileOrder,
     error: job.error,
+    log: job.log, // last ~4000 chars of ffmpeg stderr — useful for debugging stuck/slow jobs
   });
 });
 
