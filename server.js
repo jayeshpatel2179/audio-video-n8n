@@ -132,6 +132,20 @@ app.post('/job/:jobId/finish', checkApiKey, express.urlencoded({ extended: true 
     return res.status(400).json({ error: 'No files were uploaded for this job.' });
   }
 
+  // Guard against duplicate /finish calls (e.g. re-running a node in n8n).
+  // Without this, every extra call spawns another concurrent ffmpeg process
+  // for the same job, which fight each other for CPU/memory and can prevent
+  // any of them from ever finishing.
+  if (job.status === 'processing' || job.status === 'done') {
+    return res.json({
+      jobId,
+      status: job.status,
+      order: job.fileOrder,
+      warning: job.warning,
+      note: 'This job was already started or finished — ignoring duplicate /finish call.',
+    });
+  }
+
   const sortable = job.files.map((f) => ({
     file: f,
     part: extractPartNumber(f.originalname),
